@@ -1,0 +1,576 @@
+<#@ template tier="2" #>
+<#@ import namespace="System.Data" #>
+<#@ import namespace="System.Linq" #>
+<#@ import namespace="System.Text" #>
+<#
+/*
+================================================================================
+GenericTableSync.biml - Generic BIML Template for Landing Table Synchronization
+================================================================================
+
+PURPOSE:
+    Generates a Landing table and SSIS synchronization package from a view.
+    
+INPUTS (RootNode CustomAttributes):
+    - ViewSchema: Schema containing the view (e.g., "ERP")
+    - ViewName: View name ending in "View" (e.g., "CustomerView")
+    - SourceConnectionString: Connection to source database
+    - LandingConnectionString: Connection to Landing database
+
+OUTPUTS:
+    - Landing table DDL with PK, indexes
+    - SSIS package with data flow and control flow
+
+CONVENTION:
+    View: {Schema}.{Table}View → Landing Table: {Schema}.{Table}
+
+AUTHOR: Auto-generated
+VERSION: 1.0
+DATE: 2026-05-21
+================================================================================
+*/
+
+// ============================================================================
+// PARAMETERS & VALIDATION
+// ============================================================================
+
+// Get parameters from RootNode custom attributes
+string viewSchema = RootNode.CustomAttributes["ViewSchema"] ?? "ERP";
+string viewName = RootNode.CustomAttributes["ViewName"] ?? "CustomerView";
+string sourceConnectionString = RootNode.CustomAttributes["SourceConnectionString"] ?? "";
+string landingConnectionString = RootNode.CustomAttributes["LandingConnectionString"] ?? "";
+
+// Validate view name ends with "View"
+if (!viewName.EndsWith("View"))
+{
+    throw new Exception($"View name '{viewName}' must end with 'View'. Example: CustomerView");
+}
+
+// Derive table name (remove "View" suffix)
+string tableName = viewName.Substring(0, viewName.Length - 4);
+
+// Package name
+string packageName = $"Load_{viewSchema}_{tableName}";
+
+// Log processing
+Console.WriteLine($"Processing {viewSchema}.{viewName} → {viewSchema}.{tableName}");
+
+// ============================================================================
+// METADATA EXTRACTION
+// ============================================================================
+
+// Query to get column metadata from view
+string metadataQuery = $@"
+    SELECT 
+        c.COLUMN_NAME,
+        c.ORDINAL_POSITION,
+        c.DATA_TYPE,
+        c.CHARACTER_MAXIMUM_LENGTH,
+        c.NUMERIC_PRECISION,
+        c.NUMERIC_SCALE,
+        c.IS_NULLABLE,
+        CASE 
+            WHEN c.COLUMN_NAME IN ('ChangeHashKey', 'InsertDatetime', 'UpdateDatetime', 'IsDeleted')
+            THEN 1 
+            ELSE 0
+        END AS IsTechnical
+    FROM INFORMATION_SCHEMA.COLUMNS c
+    WHERE c.TABLE_SCHEMA = '{viewSchema}'
+        AND c.TABLE_NAME = '{viewName}'
+    ORDER BY c.ORDINAL_POSITION";
+
+// Execute query to get metadata
+DataTable metadata = ExternalDataAccess.GetDataTable(landingConnectionString, metadataQuery);
+
+if (metadata.Rows.Count == 0)
+{
+    throw new Exception($"View {viewSchema}.{viewName} not found or has no columns");
+}
+
+// ============================================================================
+// COLUMN CLASSIFICATION
+// ============================================================================
+
+// Find the position of ChangeHashKey
+var changeHashRow = metadata.AsEnumerable()
+    .FirstOrDefault(r => r.Field<string>("COLUMN_NAME") == "ChangeHashKey");
+
+if (changeHashRow == null)
+{
+    throw new Exception($"View {viewSchema}.{viewName} is missing ChangeHashKey column");
+}
+
+int changeHashPosition = changeHashRow.Field<int>("ORDINAL_POSITION");
+
+// Classify columns
+var pkColumns = metadata.AsEnumerable()
+    .Where(r => r.Field<int>("ORDINAL_POSITION") < changeHashPosition)
+    .ToList();
+
+var technicalColumns = metadata.AsEnumerable()
+    .Where(r => r.Field<int>("IsTechnical") == 1)
+    .ToList();
+
+var businessColumns = metadata.AsEnumerable()
+    .Where(r => r.Field<int>("ORDINAL_POSITION") > changeHashPosition + 3
+            && r.Field<int>("IsTechnical") == 0)
+    .ToList();
+
+// Validate we have at least one PK column
+if (pkColumns.Count == 0)
+{
+    throw new Exception($"View {viewSchema}.{viewName} has no primary key columns (columns before ChangeHashKey)");
+}
+
+// Validate all technical columns are present
+string[] requiredTechnical = new[] { "ChangeHashKey", "InsertDatetime", "UpdateDatetime", "IsDeleted" };
+var foundTechnical = technicalColumns.Select(r => r.Field<string>("COLUMN_NAME")).ToList();
+var missingTechnical = requiredTechnical.Except(foundTechnical).ToList();
+
+if (missingTechnical.Any())
+{
+    throw new Exception($"View {viewSchema}.{viewName} is missing technical columns: {string.Join(", ", missingTechnical)}");
+}
+
+// ============================================================================
+// HELPER FUNCTIONS
+// ============================================================================
+
+// Map SQL data types to BIML data types
+Func<DataRow, string> GetBimlDataType = (DataRow col) =>
+{
+    string sqlType = col.Field<string>("DATA_TYPE").ToLower();
+    object maxLength = col["CHARACTER_MAXIMUM_LENGTH"];
+    object precision = col["NUMERIC_PRECISION"];
+    object scale = col["NUMERIC_SCALE"];
+    
+    switch (sqlType)
+    {
+        case "int": return "Int32";
+        case "bigint": return "Int64";
+        case "smallint": return "Int16";
+        case "tinyint": return "Byte";
+        case "bit": return "Boolean";
+        case "decimal":
+        case "numeric":
+            return $"Decimal\" Precision=\"{precision}\" Scale=\"{scale}";
+        case "money": return "Currency";
+        case "datetime": return "DateTime";
+        case "datetime2": return "DateTime2";
+        case "date": return "Date";
+        case "time": return "Time";
+        case "datetimeoffset": return "DateTimeOffset";
+        case "binary":
+            return maxLength != DBNull.Value ? $"Binary\" Length=\"{maxLength}" : "Binary\" Length=\"32";
+        case "varbinary":
+            return maxLength != DBNull.Value && (int)maxLength != -1 
+                ? $"Binary\" Length=\"{maxLength}" 
+                : "Binary\" Length=\"8000";
+        case "nvarchar":
+            return maxLength != DBNull.Value && (int)maxLength != -1 
+                ? $"String\" Length=\"{maxLength}" 
+                : "String\" Length=\"4000";
+        case "varchar":
+            return maxLength != DBNull.Value && (int)maxLength != -1 
+                ? $"AnsiString\" Length=\"{maxLength}" 
+                : "AnsiString\" Length=\"8000";
+        case "nchar":
+            return maxLength != DBNull.Value ? $"String\" Length=\"{maxLength}" : "String\" Length=\"1";
+        case "char":
+            return maxLength != DBNull.Value ? $"AnsiString\" Length=\"{maxLength}" : "AnsiString\" Length=\"1";
+        case "uniqueidentifier": return "Guid";
+        case "xml": return "Xml";
+        default: return "String\" Length=\"255";
+    }
+};
+
+// Build hash calculation expression
+Func<string> BuildHashExpression = () =>
+{
+    var hashParts = new List<string>();
+    
+    foreach (DataRow col in businessColumns)
+    {
+        string colName = col.Field<string>("COLUMN_NAME");
+        string dataType = col.Field<string>("DATA_TYPE").ToLower();
+        string isNullable = col.Field<string>("IS_NULLABLE");
+        
+        string expr;
+        
+        // Handle NULLable columns
+        bool nullable = (isNullable == "YES");
+        
+        // Handle different data types
+        if (new[] { "int", "bigint", "smallint", "tinyint", "decimal", "numeric", "money", "float", "real" }.Contains(dataType))
+        {
+            // Numeric: cast to string
+            expr = $"CAST([{colName}] AS NVARCHAR(50))";
+            if (nullable) expr = $"ISNULL({expr}, '')";
+        }
+        else if (new[] { "datetime", "datetime2", "date", "smalldatetime" }.Contains(dataType))
+        {
+            // Date: convert to ISO format
+            expr = $"CONVERT(NVARCHAR(23), [{colName}], 121)";
+            if (nullable) expr = $"ISNULL({expr}, '')";
+        }
+        else if (new[] { "bit" }.Contains(dataType))
+        {
+            // Boolean: cast to string
+            expr = $"CAST([{colName}] AS NVARCHAR(1))";
+            if (nullable) expr = $"ISNULL({expr}, '')";
+        }
+        else if (new[] { "uniqueidentifier" }.Contains(dataType))
+        {
+            // GUID: cast to string
+            expr = $"CAST([{colName}] AS NVARCHAR(36))";
+            if (nullable) expr = $"ISNULL({expr}, '')";
+        }
+        else
+        {
+            // String types: use as-is
+            expr = $"[{colName}]";
+            if (nullable) expr = $"ISNULL({expr}, '')";
+        }
+        
+        hashParts.Add(expr);
+    }
+    
+    return "HASHBYTES('SHA2_256', CONCAT(" + string.Join(", '|', ", hashParts) + "))";
+};
+
+string hashCalculation = BuildHashExpression();
+
+// Build column lists for SQL statements
+string pkColumnsList = string.Join(", ", pkColumns.Select(r => $"[{r.Field<string>("COLUMN_NAME")}]"));
+string businessColumnsList = string.Join(", ", businessColumns.Select(r => $"[{r.Field<string>("COLUMN_NAME")}]"));
+string allColumnsList = string.Join(", ", metadata.AsEnumerable().Select(r => $"[{r.Field<string>("COLUMN_NAME")}]"));
+
+// ============================================================================
+// GENERATE CONNECTION NAMES
+// ============================================================================
+
+string sourceConnectionName = $"Source_{viewSchema}";
+string landingConnectionName = "Landing";
+
+#>
+<Biml xmlns="http://schemas.varigence.com/biml.xsd">
+    
+    <!-- ================================================================ -->
+    <!-- CONNECTIONS                                                      -->
+    <!-- ================================================================ -->
+    <Connections>
+        <Connection Name="<#= sourceConnectionName #>" 
+                    ConnectionString="<#= sourceConnectionString #>" />
+        <Connection Name="<#= landingConnectionName #>" 
+                    ConnectionString="<#= landingConnectionString #>" />
+    </Connections>
+    
+    <!-- ================================================================ -->
+    <!-- TABLE: <#= viewSchema #>.<#= tableName #>                       -->
+    <!-- ================================================================ -->
+    <Tables>
+        <Table Name="<#= tableName #>" 
+               SchemaName="<#= viewSchema #>" 
+               ConnectionName="<#= landingConnectionName #>">
+            <Columns>
+                <!-- PRIMARY KEY COLUMNS -->
+<# foreach (DataRow col in pkColumns) { #>
+                <Column Name="<#= col.Field<string>("COLUMN_NAME") #>" 
+                        DataType="<#= GetBimlDataType(col) #>" 
+                        IsNullable="false" />
+<# } #>
+                
+                <!-- TECHNICAL COLUMNS -->
+                <Column Name="ChangeHashKey" DataType="Binary" Length="32" IsNullable="false" />
+                <Column Name="InsertDatetime" DataType="DateTime" IsNullable="false" 
+                        Default="CURRENT_TIMESTAMP" />
+                <Column Name="UpdateDatetime" DataType="DateTime" IsNullable="false" 
+                        Default="CURRENT_TIMESTAMP" />
+                <Column Name="IsDeleted" DataType="Boolean" IsNullable="false" Default="0" />
+                
+                <!-- BUSINESS COLUMNS -->
+<# foreach (DataRow col in businessColumns) { #>
+                <Column Name="<#= col.Field<string>("COLUMN_NAME") #>" 
+                        DataType="<#= GetBimlDataType(col) #>" 
+                        IsNullable="<#= col.Field<string>("IS_NULLABLE").ToLower() #>" />
+<# } #>
+            </Columns>
+            
+            <Keys>
+                <PrimaryKey Name="PK_<#= viewSchema #>_<#= tableName #>">
+                    <Columns>
+<# foreach (DataRow col in pkColumns) { #>
+                        <Column ColumnName="<#= col.Field<string>("COLUMN_NAME") #>" />
+<# } #>
+                    </Columns>
+                </PrimaryKey>
+            </Keys>
+            
+            <Indexes>
+                <Index Name="IX_<#= viewSchema #>_<#= tableName #>_ChangeHashKey">
+                    <Columns>
+                        <Column ColumnName="ChangeHashKey" />
+                    </Columns>
+                </Index>
+                <Index Name="IX_<#= viewSchema #>_<#= tableName #>_Temporal">
+                    <Columns>
+                        <Column ColumnName="UpdateDatetime" />
+                        <Column ColumnName="IsDeleted" />
+                    </Columns>
+                </Index>
+            </Indexes>
+        </Table>
+    </Tables>
+    
+    <!-- ================================================================ -->
+    <!-- PACKAGE: <#= packageName #>                                     -->
+    <!-- ================================================================ -->
+    <Packages>
+        <Package Name="<#= packageName #>" 
+                 ConstraintMode="Linear"
+                 ProtectionLevel="EncryptSensitiveWithUserKey">
+            
+            <Variables>
+                <Variable Name="SourceSchema" DataType="String"><#= viewSchema #></Variable>
+                <Variable Name="SourceTable" DataType="String"><#= tableName #></Variable>
+                <Variable Name="LandingSchema" DataType="String"><#= viewSchema #></Variable>
+                <Variable Name="LandingTable" DataType="String"><#= tableName #></Variable>
+                <Variable Name="PKColumns" DataType="String"><#= pkColumnsList #></Variable>
+                <Variable Name="RecordsInserted" DataType="Int32">0</Variable>
+                <Variable Name="RecordsUpdated" DataType="Int32">0</Variable>
+                <Variable Name="RecordsDeleted" DataType="Int32">0</Variable>
+                <Variable Name="ExecutionStart" DataType="DateTime">1/1/1900</Variable>
+            </Variables>
+            
+            <Tasks>
+                
+                <!-- Task 1: Set Execution Start Time -->
+                <ExecuteSQL Name="Set Execution Start" ConnectionName="<#= landingConnectionName #>">
+                    <DirectInput>SELECT GETDATE() AS ExecutionStart</DirectInput>
+                    <Results>
+                        <Result Name="0" VariableName="User.ExecutionStart" />
+                    </Results>
+                </ExecuteSQL>
+                
+                <!-- Task 2: Create Staging Table -->
+                <ExecuteSQL Name="Create Staging Table" ConnectionName="<#= landingConnectionName #>">
+                    <DirectInput><![CDATA[
+IF OBJECT_ID('tempdb..#Staging_<#= viewSchema #>_<#= tableName #>') IS NOT NULL
+    DROP TABLE #Staging_<#= viewSchema #>_<#= tableName #>;
+
+CREATE TABLE #Staging_<#= viewSchema #>_<#= tableName #>
+(
+<# foreach (DataRow col in pkColumns) { 
+    string colName = col.Field<string>("COLUMN_NAME");
+    string dataType = col.Field<string>("DATA_TYPE");
+    string length = col["CHARACTER_MAXIMUM_LENGTH"] != DBNull.Value ? $"({col["CHARACTER_MAXIMUM_LENGTH"]})" : "";
+#>
+    [<#= colName #>] <#= dataType.ToUpper() #><#= length #> NOT NULL,
+<# } #>
+    [ChangeHashKey] BINARY(32) NOT NULL,
+<# foreach (DataRow col in businessColumns) { 
+    string colName = col.Field<string>("COLUMN_NAME");
+    string dataType = col.Field<string>("DATA_TYPE");
+    string length = col["CHARACTER_MAXIMUM_LENGTH"] != DBNull.Value ? $"({col["CHARACTER_MAXIMUM_LENGTH"]})" : "";
+    string nullable = col.Field<string>("IS_NULLABLE") == "YES" ? "NULL" : "NOT NULL";
+#>
+    [<#= colName #>] <#= dataType.ToUpper() #><#= length #> <#= nullable #><#= col == businessColumns.Last() ? "" : "," #>
+<# } #>
+);
+
+CREATE CLUSTERED INDEX CIX_PK ON #Staging_<#= viewSchema #>_<#= tableName #> (<#= pkColumnsList #>);
+                    ]]></DirectInput>
+                </ExecuteSQL>
+                
+                <!-- Task 3: Extract and Load to Staging -->
+                <Dataflow Name="Extract and Load to Staging">
+                    <Transformations>
+                        
+                        <!-- Source: Extract with Hash Calculation -->
+                        <OleDbSource Name="Extract from Source" ConnectionName="<#= sourceConnectionName #>">
+                            <DirectInput><![CDATA[
+SELECT 
+    <#= pkColumnsList #>,
+    <#= hashCalculation #> AS [ChangeHashKey],
+    <#= businessColumnsList #>
+FROM [<#= viewSchema #>].[<#= tableName #>]
+                            ]]></DirectInput>
+                        </OleDbSource>
+                        
+                        <!-- Destination: Load to Staging -->
+                        <OleDbDestination Name="Load to Staging" 
+                                          ConnectionName="<#= landingConnectionName #>"
+                                          UseFastLoadIfAvailable="true"
+                                          TableLock="true"
+                                          CheckConstraints="false">
+                            <ExternalTableOutput Table="#Staging_<#= viewSchema #>_<#= tableName #>" />
+                        </OleDbDestination>
+                        
+                    </Transformations>
+                </Dataflow>
+                
+                <!-- Task 4: MERGE Staging to Landing -->
+                <ExecuteSQL Name="Merge to Landing" ConnectionName="<#= landingConnectionName #>">
+                    <DirectInput><![CDATA[
+DECLARE @InsertCount INT = 0, @UpdateCount INT = 0, @DeleteCount INT = 0;
+
+MERGE [<#= viewSchema #>].[<#= tableName #>] AS target
+USING #Staging_<#= viewSchema #>_<#= tableName #> AS source
+    ON <#= string.Join(" AND ", pkColumns.Select(r => $"target.[{r.Field<string>("COLUMN_NAME")}] = source.[{r.Field<string>("COLUMN_NAME")}]")) #>
+
+WHEN MATCHED AND target.[ChangeHashKey] <> source.[ChangeHashKey] THEN
+    UPDATE SET
+        [ChangeHashKey] = source.[ChangeHashKey],
+        [UpdateDatetime] = CURRENT_TIMESTAMP<#= businessColumns.Any() ? "," : "" #>
+<# for (int i = 0; i < businessColumns.Count; i++) { 
+    var col = businessColumns[i];
+    string colName = col.Field<string>("COLUMN_NAME");
+#>
+        [<#= colName #>] = source.[<#= colName #>]<#= i < businessColumns.Count - 1 ? "," : "" #>
+<# } #>
+
+WHEN NOT MATCHED BY TARGET THEN
+    INSERT (
+        <#= pkColumnsList #>,
+        [ChangeHashKey],
+        [InsertDatetime],
+        [UpdateDatetime],
+        [IsDeleted]<#= businessColumns.Any() ? "," : "" #>
+<# for (int i = 0; i < businessColumns.Count; i++) { #>
+        [<#= businessColumns[i].Field<string>("COLUMN_NAME") #>]<#= i < businessColumns.Count - 1 ? "," : "" #>
+<# } #>
+    )
+    VALUES (
+        <#= string.Join(", ", pkColumns.Select(r => $"source.[{r.Field<string>("COLUMN_NAME")}]")) #>,
+        source.[ChangeHashKey],
+        CURRENT_TIMESTAMP,
+        CURRENT_TIMESTAMP,
+        0<#= businessColumns.Any() ? "," : "" #>
+<# for (int i = 0; i < businessColumns.Count; i++) { #>
+        source.[<#= businessColumns[i].Field<string>("COLUMN_NAME") #>]<#= i < businessColumns.Count - 1 ? "," : "" #>
+<# } #>
+    )
+
+WHEN NOT MATCHED BY SOURCE AND target.[IsDeleted] = 0 THEN
+    UPDATE SET
+        [UpdateDatetime] = CURRENT_TIMESTAMP,
+        [IsDeleted] = 1;
+
+-- Get row counts
+SET @InsertCount = (SELECT COUNT(*) FROM [<#= viewSchema #>].[<#= tableName #>] WHERE [InsertDatetime] >= @ExecutionStart);
+SET @UpdateCount = (SELECT COUNT(*) FROM [<#= viewSchema #>].[<#= tableName #>] WHERE [UpdateDatetime] >= @ExecutionStart AND [InsertDatetime] < @ExecutionStart AND [IsDeleted] = 0);
+SET @DeleteCount = (SELECT COUNT(*) FROM [<#= viewSchema #>].[<#= tableName #>] WHERE [UpdateDatetime] >= @ExecutionStart AND [IsDeleted] = 1);
+
+SELECT @InsertCount AS RecordsInserted, @UpdateCount AS RecordsUpdated, @DeleteCount AS RecordsDeleted;
+                    ]]></DirectInput>
+                    <Parameters>
+                        <Parameter Name="0" VariableName="User.ExecutionStart" DataType="DateTime" />
+                    </Parameters>
+                    <Results>
+                        <Result Name="0" VariableName="User.RecordsInserted" />
+                        <Result Name="1" VariableName="User.RecordsUpdated" />
+                        <Result Name="2" VariableName="User.RecordsDeleted" />
+                    </Results>
+                </ExecuteSQL>
+                
+                <!-- Task 5: Log Execution -->
+                <ExecuteSQL Name="Log Execution" ConnectionName="<#= landingConnectionName #>">
+                    <DirectInput><![CDATA[
+IF OBJECT_ID('[audit].[ETLLog]', 'U') IS NOT NULL
+BEGIN
+    INSERT INTO [audit].[ETLLog]
+    (
+        PackageName,
+        SourceSchema,
+        SourceTable,
+        RecordsInserted,
+        RecordsUpdated,
+        RecordsDeleted,
+        ExecutionStart,
+        ExecutionEnd,
+        Status
+    )
+    VALUES
+    (
+        '<#= packageName #>',
+        '<#= viewSchema #>',
+        '<#= tableName #>',
+        ?,
+        ?,
+        ?,
+        ?,
+        GETDATE(),
+        'Success'
+    );
+END
+                    ]]></DirectInput>
+                    <Parameters>
+                        <Parameter Name="0" VariableName="User.RecordsInserted" DataType="Int32" />
+                        <Parameter Name="1" VariableName="User.RecordsUpdated" DataType="Int32" />
+                        <Parameter Name="2" VariableName="User.RecordsDeleted" DataType="Int32" />
+                        <Parameter Name="3" VariableName="User.ExecutionStart" DataType="DateTime" />
+                    </Parameters>
+                </ExecuteSQL>
+                
+                <!-- Task 6: Cleanup Staging Table -->
+                <ExecuteSQL Name="Cleanup Staging" ConnectionName="<#= landingConnectionName #>">
+                    <DirectInput><![CDATA[
+IF OBJECT_ID('tempdb..#Staging_<#= viewSchema #>_<#= tableName #>') IS NOT NULL
+    DROP TABLE #Staging_<#= viewSchema #>_<#= tableName #>;
+                    ]]></DirectInput>
+                </ExecuteSQL>
+                
+            </Tasks>
+            
+            <!-- Event Handlers -->
+            <EventHandlers>
+                <EventHandler EventType="OnError">
+                    <Tasks>
+                        <ExecuteSQL Name="Log Error" ConnectionName="<#= landingConnectionName #>">
+                            <DirectInput><![CDATA[
+IF OBJECT_ID('[audit].[ETLError]', 'U') IS NOT NULL
+BEGIN
+    INSERT INTO [audit].[ETLError]
+    (
+        PackageName,
+        TaskName,
+        SourceSchema,
+        SourceTable,
+        ErrorCode,
+        ErrorDescription,
+        ErrorDatetime
+    )
+    VALUES
+    (
+        '<#= packageName #>',
+        ?,
+        '<#= viewSchema #>',
+        '<#= tableName #>',
+        ?,
+        ?,
+        GETDATE()
+    );
+END
+                            ]]></DirectInput>
+                            <Parameters>
+                                <Parameter Name="0" VariableName="System.TaskName" DataType="String" />
+                                <Parameter Name="1" VariableName="System.ErrorCode" DataType="Int32" />
+                                <Parameter Name="2" VariableName="System.ErrorDescription" DataType="String" />
+                            </Parameters>
+                        </ExecuteSQL>
+                    </Tasks>
+                </EventHandler>
+            </EventHandlers>
+            
+        </Package>
+    </Packages>
+    
+</Biml>
+
+<#
+// Log completion
+Console.WriteLine($"  ✓ Generated table {viewSchema}.{tableName}");
+Console.WriteLine($"  ✓ Generated package {packageName}.dtsx");
+Console.WriteLine($"  - PK columns: {pkColumns.Count}");
+Console.WriteLine($"  - Business columns: {businessColumns.Count}");
+#>

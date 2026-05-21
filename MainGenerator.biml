@@ -1,0 +1,392 @@
+<#@ template tier="1" #>
+<#@ import namespace="System.Data" #>
+<#@ import namespace="System.Linq" #>
+<#@ import namespace="System.Collections.Generic" #>
+<#
+/*
+================================================================================
+MainGenerator.biml - Main Orchestrator for Landing Table Generation
+================================================================================
+
+PURPOSE:
+    Discovers all views ending in "View" within specified schemas and generates
+    landing tables and SSIS packages for each by calling GenericTableSync.biml.
+    
+CONFIGURATION:
+    - Modify the configuration section below to set:
+        * Landing database connection string
+        * Source database connection strings per schema
+        * Schemas to process
+    
+OUTPUTS:
+    - Calls GenericTableSync.biml for each discovered view
+    - Generates all landing tables and packages in one execution
+    
+CONVENTION:
+    Only processes views with names ending in "View"
+    Example: ERP.CustomerView, SALESFORCE.AccountView
+
+USAGE:
+    1. Configure connection strings and schemas below
+    2. Right-click project in BimlStudio → Build
+    3. Review generated packages in SSIS project
+    4. Deploy to SSISDB catalog
+
+AUTHOR: Auto-generated
+VERSION: 1.0
+DATE: 2026-05-21
+================================================================================
+*/
+
+// ============================================================================
+// CONFIGURATION SECTION - MODIFY THESE VALUES
+// ============================================================================
+
+// Landing database connection string
+string landingConnectionString = @"
+    Data Source=LANDING_SERVER;
+    Initial Catalog=Landing;
+    Provider=SQLNCLI11;
+    Integrated Security=SSPI;
+    Application Name=BimlGenerator;
+";
+
+// Source database connection strings (one per schema)
+var sourceConnectionStrings = new Dictionary<string, string>
+{
+    { 
+        "ERP", 
+        @"Data Source=ERP_PROD_SERVER;
+          Initial Catalog=ERP_Production;
+          Provider=SQLNCLI11;
+          Integrated Security=SSPI;
+          Application Name=BimlGenerator;" 
+    },
+    { 
+        "SALESFORCE", 
+        @"Data Source=CRM_PROD_SERVER;
+          Initial Catalog=Salesforce_Replicated;
+          Provider=SQLNCLI11;
+          Integrated Security=SSPI;
+          Application Name=BimlGenerator;" 
+    },
+    { 
+        "MES", 
+        @"Data Source=MES_PROD_SERVER;
+          Initial Catalog=Manufacturing;
+          Provider=SQLNCLI11;
+          Integrated Security=SSPI;
+          Application Name=BimlGenerator;" 
+    }
+};
+
+// Schemas to process (must have entries in sourceConnectionStrings)
+string[] schemasToProcess = new[] { "ERP", "SALESFORCE", "MES" };
+
+// Optional: Filter specific views (empty = process all views ending in "View")
+// Example: new[] { "CustomerView", "OrderView" }
+string[] viewFilter = new string[] { };
+
+// Optional: Exclude specific views
+// Example: new[] { "TempView", "TestView" }
+string[] viewExclude = new string[] { };
+
+// ============================================================================
+// DISCOVERY AND PROCESSING
+// ============================================================================
+
+Console.WriteLine("================================================================================");
+Console.WriteLine("Landing Table and Package Generator");
+Console.WriteLine("================================================================================");
+Console.WriteLine($"Processing {schemasToProcess.Length} schema(s)");
+Console.WriteLine($"Landing Connection: {landingConnectionString.Split(';').First(s => s.Contains("Data Source")).Trim()}");
+Console.WriteLine("================================================================================");
+Console.WriteLine();
+
+// Track statistics
+int totalViews = 0;
+int totalTables = 0;
+int totalPackages = 0;
+var processingLog = new List<string>();
+
+// Process each schema
+foreach (string schema in schemasToProcess)
+{
+    Console.WriteLine($"Processing schema: {schema}");
+    Console.WriteLine(new string('-', 80));
+    
+    // Validate schema has connection string
+    if (!sourceConnectionStrings.ContainsKey(schema))
+    {
+        string error = $"ERROR: No connection string configured for schema '{schema}'";
+        Console.WriteLine(error);
+        processingLog.Add(error);
+        Console.WriteLine();
+        continue;
+    }
+    
+    string sourceConnection = sourceConnectionStrings[schema];
+    
+    // Query to discover views ending in "View"
+    string viewDiscoveryQuery = $@"
+        SELECT 
+            TABLE_SCHEMA,
+            TABLE_NAME,
+            SUBSTRING(TABLE_NAME, 1, LEN(TABLE_NAME) - 4) AS TableName
+        FROM INFORMATION_SCHEMA.VIEWS
+        WHERE TABLE_SCHEMA = '{schema}'
+            AND TABLE_NAME LIKE '%View'
+            AND TABLE_NAME <> 'View'  -- Exclude if accidentally named just 'View'
+        ORDER BY TABLE_NAME";
+    
+    DataTable views;
+    
+    try
+    {
+        // Execute query against Landing database (where views should exist)
+        views = ExternalDataAccess.GetDataTable(landingConnectionString, viewDiscoveryQuery);
+    }
+    catch (Exception ex)
+    {
+        string error = $"ERROR querying views for schema '{schema}': {ex.Message}";
+        Console.WriteLine(error);
+        processingLog.Add(error);
+        Console.WriteLine();
+        continue;
+    }
+    
+    // Apply filters
+    var viewsToProcess = views.AsEnumerable();
+    
+    if (viewFilter.Length > 0)
+    {
+        viewsToProcess = viewsToProcess.Where(r => 
+            viewFilter.Contains(r.Field<string>("TABLE_NAME")));
+    }
+    
+    if (viewExclude.Length > 0)
+    {
+        viewsToProcess = viewsToProcess.Where(r => 
+            !viewExclude.Contains(r.Field<string>("TABLE_NAME")));
+    }
+    
+    var viewList = viewsToProcess.ToList();
+    
+    if (viewList.Count == 0)
+    {
+        Console.WriteLine($"  No views found ending in 'View' for schema '{schema}'");
+        Console.WriteLine();
+        continue;
+    }
+    
+    Console.WriteLine($"  Found {viewList.Count} view(s) to process:");
+    foreach (DataRow view in viewList)
+    {
+        Console.WriteLine($"    - {view.Field<string>("TABLE_NAME")} → {view.Field<string>("TableName")}");
+    }
+    Console.WriteLine();
+    
+    totalViews += viewList.Count;
+    
+    // Process each view
+    foreach (DataRow view in viewList)
+    {
+        string viewName = view.Field<string>("TABLE_NAME");
+        string tableName = view.Field<string>("TableName");
+        
+        try
+        {
+            // Set custom attributes for GenericTableSync.biml
+            RootNode.CustomAttributes.Clear();
+            RootNode.CustomAttributes.Add("ViewSchema", schema);
+            RootNode.CustomAttributes.Add("ViewName", viewName);
+            RootNode.CustomAttributes.Add("SourceConnectionString", sourceConnection);
+            RootNode.CustomAttributes.Add("LandingConnectionString", landingConnectionString);
+            
+            // Include GenericTableSync.biml (this will generate the table and package)
+#>
+            <#@ include file="GenericTableSync.biml" #>
+<#
+            totalTables++;
+            totalPackages++;
+            
+            string success = $"  ✓ {schema}.{viewName} → {schema}.{tableName} (Load_{schema}_{tableName}.dtsx)";
+            processingLog.Add(success);
+        }
+        catch (Exception ex)
+        {
+            string error = $"  ✗ ERROR processing {schema}.{viewName}: {ex.Message}";
+            Console.WriteLine(error);
+            processingLog.Add(error);
+        }
+    }
+    
+    Console.WriteLine();
+}
+
+// ============================================================================
+// SUMMARY
+// ============================================================================
+
+Console.WriteLine("================================================================================");
+Console.WriteLine("GENERATION SUMMARY");
+Console.WriteLine("================================================================================");
+Console.WriteLine($"Schemas Processed:  {schemasToProcess.Length}");
+Console.WriteLine($"Views Discovered:   {totalViews}");
+Console.WriteLine($"Tables Generated:   {totalTables}");
+Console.WriteLine($"Packages Generated: {totalPackages}");
+Console.WriteLine("================================================================================");
+Console.WriteLine();
+
+if (processingLog.Count > 0)
+{
+    Console.WriteLine("Detailed Log:");
+    Console.WriteLine(new string('-', 80));
+    foreach (var logEntry in processingLog)
+    {
+        Console.WriteLine(logEntry);
+    }
+    Console.WriteLine();
+}
+
+// Check for errors
+var errors = processingLog.Where(l => l.Contains("ERROR") || l.Contains("✗")).ToList();
+if (errors.Count > 0)
+{
+    Console.WriteLine($"⚠ WARNING: {errors.Count} error(s) occurred during generation");
+    Console.WriteLine("Review the detailed log above for error details");
+    Console.WriteLine();
+}
+else
+{
+    Console.WriteLine("✓ All views processed successfully!");
+    Console.WriteLine();
+}
+
+Console.WriteLine("================================================================================");
+Console.WriteLine("NEXT STEPS");
+Console.WriteLine("================================================================================");
+Console.WriteLine("1. Review generated tables in Tables folder");
+Console.WriteLine("2. Review generated packages in Packages folder");
+Console.WriteLine("3. Test a few packages manually in SSDT");
+Console.WriteLine("4. Deploy packages to SSISDB catalog:");
+Console.WriteLine("   - Right-click project → Deploy");
+Console.WriteLine("   - Or use ispac deployment script");
+Console.WriteLine("5. Schedule packages in SQL Server Agent");
+Console.WriteLine("================================================================================");
+Console.WriteLine();
+
+// Optional: Generate deployment script
+bool generateDeploymentScript = false;  // Set to true to generate
+
+if (generateDeploymentScript)
+{
+    var deployScript = new StringBuilder();
+    deployScript.AppendLine("-- ========================================");
+    deployScript.AppendLine("-- Landing Tables Deployment Script");
+    deployScript.AppendLine($"-- Generated: {DateTime.Now}");
+    deployScript.AppendLine("-- ========================================");
+    deployScript.AppendLine();
+    deployScript.AppendLine("USE [Landing];");
+    deployScript.AppendLine("GO");
+    deployScript.AppendLine();
+    
+    foreach (string schema in schemasToProcess)
+    {
+        deployScript.AppendLine($"-- Schema: {schema}");
+        deployScript.AppendLine($"IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = '{schema}')");
+        deployScript.AppendLine($"    EXEC('CREATE SCHEMA [{schema}]');");
+        deployScript.AppendLine("GO");
+        deployScript.AppendLine();
+    }
+    
+    deployScript.AppendLine("-- Tables and indexes will be created by BIML compilation");
+    deployScript.AppendLine("-- Review Tables folder for DDL scripts");
+    deployScript.AppendLine();
+    deployScript.AppendLine("-- ========================================");
+    deployScript.AppendLine("-- Audit Tables (if not exists)");
+    deployScript.AppendLine("-- ========================================");
+    deployScript.AppendLine();
+    deployScript.AppendLine(@"
+IF NOT EXISTS (SELECT 1 FROM sys.schemas WHERE name = 'audit')
+    EXEC('CREATE SCHEMA [audit]');
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.tables WHERE name = 'ETLLog' AND schema_id = SCHEMA_ID('audit'))
+BEGIN
+    CREATE TABLE [audit].[ETLLog]
+    (
+        ETLLogId            INT IDENTITY(1,1) PRIMARY KEY,
+        PackageName         NVARCHAR(255) NOT NULL,
+        SourceSchema        NVARCHAR(50) NOT NULL,
+        SourceTable         NVARCHAR(100) NOT NULL,
+        RecordsInserted     INT NOT NULL DEFAULT 0,
+        RecordsUpdated      INT NOT NULL DEFAULT 0,
+        RecordsDeleted      INT NOT NULL DEFAULT 0,
+        ExecutionStart      DATETIME NOT NULL,
+        ExecutionEnd        DATETIME NULL,
+        DurationSeconds     AS DATEDIFF(SECOND, ExecutionStart, ExecutionEnd),
+        Status              NVARCHAR(20) NOT NULL DEFAULT 'Running',
+        ErrorMessage        NVARCHAR(4000) NULL
+    );
+    
+    CREATE INDEX IX_ETLLog_ExecutionStart ON [audit].[ETLLog] (ExecutionStart DESC);
+    CREATE INDEX IX_ETLLog_Package ON [audit].[ETLLog] (PackageName, ExecutionStart DESC);
+END
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.tables WHERE name = 'ETLError' AND schema_id = SCHEMA_ID('audit'))
+BEGIN
+    CREATE TABLE [audit].[ETLError]
+    (
+        ErrorId             INT IDENTITY(1,1) PRIMARY KEY,
+        PackageName         NVARCHAR(255) NOT NULL,
+        TaskName            NVARCHAR(255) NULL,
+        SourceSchema        NVARCHAR(50) NULL,
+        SourceTable         NVARCHAR(100) NULL,
+        ErrorCode           INT NULL,
+        ErrorDescription    NVARCHAR(4000) NULL,
+        ErrorDatetime       DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    
+    CREATE INDEX IX_ETLError_ErrorDatetime ON [audit].[ETLError] (ErrorDatetime DESC);
+    CREATE INDEX IX_ETLError_Package ON [audit].[ETLError] (PackageName, ErrorDatetime DESC);
+END
+GO
+    ");
+    
+    System.IO.File.WriteAllText(
+        @"C:\Temp\DeployLandingTables.sql", 
+        deployScript.ToString()
+    );
+    
+    Console.WriteLine("Deployment script generated: C:\\Temp\\DeployLandingTables.sql");
+    Console.WriteLine();
+}
+
+#>
+
+<!--
+================================================================================
+BIML FRAMEWORK INITIALIZATION COMPLETE
+================================================================================
+
+This is a tier-1 BimlScript that has executed and generated tier-2 code.
+The actual table and package definitions are now being compiled by BimlStudio.
+
+If you see this comment in the output, the framework has loaded successfully.
+All table and package artifacts are generated from the included GenericTableSync.biml
+template based on the views discovered in the configured schemas.
+
+To add more views:
+    1. Create view in Landing database following naming convention (*View)
+    2. Re-run this MainGenerator.biml script
+    3. New packages will be automatically generated
+
+To modify the template:
+    1. Edit GenericTableSync.biml
+    2. Re-run this MainGenerator.biml script
+    3. All packages will be regenerated with new template
+
+================================================================================
+-->
